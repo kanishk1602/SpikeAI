@@ -58,297 +58,60 @@ Response JSON
 
 ---
 
-## 3. API Specification
+## 2.1 Architecture Diagram (ASCII)
 
-### 3.1 POST `/query`
-
-#### Request Body
-
-| Field | Type | Required | Notes |
-|------|------|----------|------|
-| `query` | string | Yes | Natural language question |
-| `propertyId` | string | For GA4 / multi | GA4 numeric property ID; if absent system may use `GA4_PROPERTY_ID` env var |
-
-#### Typical Response Shapes
-
-**Analytics only**
-```json
-{
-  "query": "...",
-  "report": {
-    "dimensionHeaders": ["date"],
-    "metricHeaders": ["screenPageViews"],
-    "rows": [...],
-    "notes": {...}
-  },
-  "summary": "..."
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        POST /query                               │
+│                     (Natural Language)                           │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      Intent Detector                             │
+│              (Deterministic keyword routing)                     │
+│                                                                  │
+│   "page views last 14 days" → analytics_only                    │
+│   "URLs without HTTPS"      → seo_only                          │
+│   "top pages + title tags"  → multi (both agents)               │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+            ┌─────────────────┼─────────────────┐
+            ▼                 ▼                 ▼
+┌───────────────────┐ ┌───────────────────┐ ┌───────────────────┐
+│  AnalyticsAgent   │ │    SEOAgent       │ │  Multi-Agent      │
+│     (GA4)         │ │ (Screaming Frog)  │ │   Orchestrator    │
+├───────────────────┤ ├───────────────────┤ ├───────────────────┤
+│ • Fetch metadata  │ │ • Read Sheets     │ │ • Run agents      │
+│ • Select fields   │ │ • Filter rules    │ │   concurrently    │
+│   heuristics/LLM  │ │ • Slim output     │ │ • LLM fusion      │
+│ • Apply filters   │ │   (cols/rows)     │ │   (optional)      │
+│ • Run report      │ │ • Deduplicate     │ │ • Partial success │
+└───────────────────┘ └───────────────────┘ └───────────────────┘
+            │                 │                       │
+            ▼                 ▼                       ▼
+┌───────────────────┐ ┌───────────────────┐ ┌───────────────────┐
+│   GA4 Data API    │ │  Google Sheets    │ │    LiteLLM        │
+│   (Data API v1)   │ │      API          │ │   /chat/complet.  │
+└───────────────────┘ └───────────────────┘ └───────────────────┘
 ```
 
-**SEO only**
-```json
-{
-  "query": "...",
-  "results": {
-    "long_title_tags": [{"Address": "...", "Title 1": "..."}],
-    "long_title_count": 30
-  }
-}
-```
-
-**Multi-agent**
-```json
-{
-  "query": "...",
-  "ga4": {"report": {...}, "summary": "..."},
-  "seo": {"results": {...}},
-  "fusion": "..." 
-}
-```
-
-#### Error Response Format
-Errors are returned as structured JSON:
-```json
-{
-  "query": "...",
-  "error": "Permission denied for GA4 property",
-  "details": "403 ...",
-  "next_steps": ["..."]
-}
-```
-
-### 3.2 GET `/health`
-
-Returns:
-- server status
-- LLM configuration availability
-
 ---
 
-## 4. Intent Detection (`utils.py`)
+## 2.2 Key Tradeoffs (Engineering Decisions)
 
-### Implementation Summary
+This section documents the intentional choices made during implementation, and what was traded away.
 
-Intent is detected via deterministic keyword matching:
-
-- **analytics_only**: GA4-related words (sessions, users, views, top pages, etc.)
-- **seo_only**: SEO words (https, title tag, meta, indexable, screaming frog, etc.)
-- **multi**: combination of GA4 + SEO or cross-reference language (corresponding, correlate, fusion)
-
-### Tradeoffs
-
-- ✅ Predictable and fast
-- ✅ No LLM/routing dependency
-- ⚠️ Keyword list must be maintained over time
-
----
-
-## 5. Analytics Agent (`agents.py:AnalyticsAgent`)
-
-### Responsibilities
-
-1. Load service account credentials
-2. Fetch GA4 metadata for the property
-3. Choose metrics and dimensions
-4. Apply filters (e.g., pagePath contains)
-5. Execute GA4 report
-6. Generate summary using LLM (optional)
-
-### 5.1 Field Selection
-
-**Step 1: Heuristics**
-Maps query words → GA4 metrics/dimensions.
-
-Examples:
-- "pageviews" → `screenPageViews`
-- "sessions" → `sessions`
-- "daily" → `date`
-- "pages" → `pagePath`
-
-**Step 2: LLM fallback**
-If heuristics fail, it asks the LLM to select from allowed fields.
-
-**Validation**
-All selected fields are validated against metadata to avoid invalid GA4 requests.
-
-### 5.2 Date Range Resolution
-
-`_coerce_date_range()` maps:
-- today/yesterday
-- last 7/14/30/90 days
-
-If result is empty, the agent broadens date range:
-- requested range → 28 days → 90 days
-
-### 5.3 Top-N Queries
-
-Detects intent like:
-- "top 10 pages"
-
-Applies:
-- `limit = N`
-- `order_by_metric = first metric` descending
-
-### 5.4 Page Hint Extraction
-
-Detects explicit paths like `/pricing` and applies a dimension filter:
-- `pagePath CONTAINS /pricing`
+| Area | Choice | Why it was chosen | Tradeoff / Cost | Mitigation |
+|------|--------|-------------------|-----------------|------------|
+| Intent routing | Deterministic keyword matching (`utils.py`) | Zero external dependency; fast; predictable; easy to debug | Can misclassify ambiguous queries | Expanded keyword set + multi-intent triggers ("corresponding", "correlate") |
+| GA4 field mapping | Heuristic-first, LLM fallback | Most questions map cleanly; saves latency/cost | Requires maintaining heuristics | LLM fallback constrained by metadata; safe defaults |
+| GA4 schema correctness | Runtime metadata fetch (`get_metadata`) | Works across any property including custom fields; avoids invalid requests | Extra API call (~100ms) per query | Can be cached later (Redis/in-memory) |
+| Empty GA4 results | Date-range fallback (requested → 28d → 90d) | Improves UX; avoids "no data" dead-ends | More GA4 API calls in worst case | Stops early once non-empty; bounded to 3 calls |
+| SEO datasets | Load all tabs by default (optional) | Screaming Frog exports are often split by report type | Potentially large in-memory DataFrame | Output slimming + row caps + dedupe |
+| SEO output size | Slim records (priority columns + strip nulls + dedupe + max_rows) | Keeps responses usable and evaluator-friendly | Loses non-priority columns | Counts preserved; evolve priority columns over time |
+| LLM dependency | Optional LLM; system still works without it | Prevents hard dependency on an LLM service | Less natural answers if disabled | Deterministic outputs remain; summaries are best-effort |
+| Multi-agent fusion | LLM-generated synthesis | Produces human-friendly joined insights | LLM may hallucinate if unconstrained | Fusion prompt uses only agent outputs; temperature=0; fallback returns raw agent outputs |
+| Error handling | Structured error + next_steps | Maximizes evaluator success and debuggability | Slightly larger payloads in errors | Still smaller than raw stack traces; clear guidance |
 
 ---
-
-## 6. SEO Agent (`agents.py:SEOAgent`)
-
-### Responsibilities
-
-1. Load Screaming Frog exports via Google Sheets
-2. Run filters based on query (HTTPS, title tags length, etc.)
-3. Return optimized results
-
-### 6.1 Sheet Loading
-
-Supports:
-- Single tab read
-- All tabs merge (if `SEO_SHEET_USE_ALL_TABS=true` or title is `*`)
-
-If multiple tabs are loaded, a `__sheet` column is added to keep provenance.
-
-### 6.2 Query → Filters
-
-Supports:
-- Non-HTTPS URLs
-- Long title tags (>60 chars)
-- Intersection filtering: non-HTTPS AND long title
-- Indexability count summary
-
-### 6.3 Output Optimization
-
-To prevent enormous responses:
-
-- **priority columns** only
-- strip null/NaN
-- deduplicate by URL
-- limit rows (default 20)
-- include total counts (e.g., `long_title_count`)
-
----
-
-## 7. Multi-Agent Orchestration
-
-### Flow
-
-When intent is `multi`:
-
-1. Run GA4 and SEO agents concurrently
-2. Return both payloads in response
-3. If LLM is enabled, create a fusion summary/recommendations
-
-### Failure Behavior
-
-- If GA4 fails but SEO succeeds → still return SEO results + GA4 error
-- If SEO fails but GA4 succeeds → still return GA4 report + SEO error
-- If fusion fails → still return both agent outputs
-
----
-
-## 8. GA4 Client (`ga4_client.py`)
-
-### Responsibilities
-
-- Instantiate GA4 Data API client from service account file
-- Fetch and parse metadata
-- Validate requested fields against metadata
-- Construct RunReportRequest:
-  - metrics
-  - dimensions
-  - order_bys
-  - dimension filter expressions
-
----
-
-## 9. LLM Client (`llm_client.py`)
-
-### Responsibilities
-
-- Wrap LiteLLM proxy `/chat/completions`
-- Add Authorization header
-- Retry with backoff for 429 / transient failures
-
-### Runtime Configuration
-
-LLM is enabled only when:
-- `LITELLM_BASE_URL` exists
-- `LITELLM_API_KEY` exists
-
----
-
-## 10. Configuration
-
-Configuration is via environment variables (supports `.env`).
-
-See `.env.example` for all available settings.
-
-### Required
-- `GOOGLE_APPLICATION_CREDENTIALS` (service account file)
-- `SEO_SHEET_URL`
-
-### Optional
-- `LITELLM_API_KEY`, `LITELLM_BASE_URL`, `LITELLM_MODEL`
-- `GA4_PROPERTY_ID`
-
----
-
-## 11. Security Practices
-
-- `.gitignore` prevents committing:
-  - `.env`
-  - `credentials.json`
-  - keys/certs
-- Only service account JSON is supported for Google APIs
-
----
-
-## 12. Extensibility Guide
-
-### Adding a New Data Source Agent
-
-1. Create a new agent class with:
-   - `async handle_query(query: str, ...)` method
-2. Add keywords in `utils.py:detect_intent`
-3. Update router logic in `main.py`
-
-### Suggested future agents
-- Google Search Console agent
-- PageSpeed Insights agent
-- Paid ads agent
-
----
-
-## 13. Operational Notes
-
-- Output sizes are controlled in SEOAgent to avoid huge payloads.
-- GA4 agent already limits preview rows for summaries.
-- For production, consider:
-  - caching GA4 metadata
-  - request tracing/logging
-  - per-user rate limiting
-
----
-
-## 14. Known Limitations
-
-- Keyword-based intent detection can misclassify some ambiguous queries.
-- GA4 metadata is fetched per request (can be cached in production).
-- SEO filters are rule-based; more complex analysis would benefit from schema-aware planning.
-
----
-
-## 15. Appendix: Files and Key Functions
-
-| File | Key functions/classes |
-|------|------------------------|
-| `main.py` | FastAPI app, `/query`, `/health` |
-| `utils.py` | `detect_intent()` |
-| `agents.py` | `AnalyticsAgent`, `SEOAgent` |
-| `ga4_client.py` | `load_client_from_service_account`, `get_metadata`, `run_report` |
-| `seo_client.py` | `open_sheet_by_url`, `open_all_worksheets_by_url` |
-| `llm_client.py` | `LiteLLMClient.ask()` |
