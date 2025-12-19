@@ -1,0 +1,34 @@
+# Secrets - NEVER commit these
+credentials.json
+.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+server.log
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
